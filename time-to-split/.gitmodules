@@ -1,0 +1,3 @@
+[submodule "norm-analysis"]
+	path = norm-analysis
+	url = https://github.com/gorokoba560/norm-analysis-of-transformer.git
