@@ -297,7 +297,7 @@ def plot_average_contribution_heatmap(
 
     plt.xlabel("To")
     plt.ylabel("From")
-    plt.title(f"{dataset_name} AttnResLN")
+    plt.title(f"{dataset_name} AttnResLN", fontsize=18)
 
     plt.tight_layout()
     out_path = os.path.join(
@@ -436,7 +436,7 @@ def plot_average_attention_heatmap(
 
     plt.xlabel("To")
     plt.ylabel("From")
-    plt.title(f"{dataset_name} Attn")
+    plt.title(f"{dataset_name} Attn", fontsize=18)
 
     plt.tight_layout()
     path = os.path.join(
@@ -669,7 +669,7 @@ def collect_all_layers_mixing_ratio_strict(
 # =========================
 if __name__ == "__main__":
     # >>> CHANGE HERE <<<
-    analysis_dir = "./data/results/analysis/SASRecAnalyze/Toys/global_timesplit/seed_17"
+    analysis_dir = "./data/results/analysis/SASRecAnalyze/Movielens-1m/global_timesplit/seed_17"
     # >>>>>>>>>>>>>>>>>>
 
     fig_dir = os.path.join(analysis_dir, f"figures_avg_recent{RECENT_K}_sourceDown")
