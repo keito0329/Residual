@@ -5,6 +5,8 @@ Models.
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
+from typing import Optional
 from transformers import BertConfig, BertModel
 
     
@@ -362,7 +364,7 @@ class BERT4Rec(nn.Module):
             )
         # if os.environ.get("BERT4REC_DEBUG_RESIDUAL_SCALE") == "1":
         #     print(f"[BERT4Rec] residual_scale={residual_scale}")
-        # norm-analysisのtransformersはtupleを返すため互換性を持たせる
+        # norm-analysis transformers return a tuple; keep compatibility
         outputs = (
             transformer_outputs[0]
             if isinstance(transformer_outputs, tuple)
@@ -425,7 +427,7 @@ class BERT4Rec(nn.Module):
         return outputs
     
 
-class FMLPRec(nn.Module):
+class SFSRec(nn.Module):
     def __init__(
         self,
         item_num: int,
@@ -435,6 +437,7 @@ class FMLPRec(nn.Module):
         dropout_rate: float = 0.1,
         add_head: bool = True,
         padding_idx: int = 0,
+        use_causal_mask: bool = True,
         analysis_dir: str = "./analysis_out",
     ):
         super().__init__()
@@ -444,18 +447,51 @@ class FMLPRec(nn.Module):
         self.emb_dropout = nn.Dropout(dropout_rate)
         self.emb_layernorm = nn.LayerNorm(hidden_units, eps=1e-8)
 
-        self.blocks = nn.ModuleList([
-            AnalyzableFMLPBlock(hidden_units, maxlen, dropout_rate)
+        self.fmlp_layers = nn.ModuleList([
+            AnalyzableFMLPFilter(hidden_units, maxlen=maxlen, dropout_rate=dropout_rate)
+            for _ in range(num_blocks)
+        ])
+        self.attn_post_lns = nn.ModuleList([
+            nn.LayerNorm(hidden_units, eps=1e-8)
             for _ in range(num_blocks)
         ])
 
+        self.ffn_layers = nn.ModuleList([
+            PointWiseFFNNoResidual(hidden_units, dropout_rate)
+            for _ in range(num_blocks)
+        ])
+        self.ffn_post_lns = nn.ModuleList([
+            nn.LayerNorm(hidden_units, eps=1e-8)
+            for _ in range(num_blocks)
+        ])
+
+        self.last_layernorm = nn.LayerNorm(hidden_units, eps=1e-8)
+
         self.add_head = add_head
         self.padding_idx = padding_idx
+        self.use_causal_mask = use_causal_mask
         self.analysis_dir = analysis_dir
+        self.initializer_range = 0.02
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv1d)):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            if module.padding_idx is not None:
+                module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
 
     def forward(
         self,
         input_ids: torch.Tensor,
+        attention_mask=None,             # optional [B, L]
         return_mixing: bool = False,
         save_analysis: bool = False,
         analysis_batch_idx: int = 0,
@@ -471,21 +507,49 @@ class FMLPRec(nn.Module):
 
         pos = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
         seqs = seqs + self.pos_emb(pos)
-        seqs = self.emb_layernorm(seqs)
         seqs = self.emb_dropout(seqs)
+        seqs = self.emb_layernorm(seqs)
 
+        if attention_mask is None:
+            attention_mask = (input_ids != self.padding_idx)
         timeline_mask = (input_ids == self.padding_idx)
         seqs = seqs * (~timeline_mask).unsqueeze(-1)
+
+        extended_attention_mask = None
+        if self.use_causal_mask:
+            attn = attention_mask.to(dtype=seqs.dtype)
+            ext = attn.unsqueeze(1).unsqueeze(2)  # [B,1,1,L]
+            max_len = attn.size(-1)
+            attn_shape = (1, max_len, max_len)
+            subsequent_mask = torch.triu(
+                torch.ones(attn_shape, device=seqs.device), diagonal=1
+            )
+            subsequent_mask = (subsequent_mask == 0).unsqueeze(1)
+            ext = ext * subsequent_mask
+            extended_attention_mask = (1.0 - ext) * -10000.0
 
         layer_stats = []
 
         # ----- Blocks -----
-        for block in self.blocks:
-            seqs, mixing = block(seqs, output_mixing=return_mixing)
+        for i in range(len(self.fmlp_layers)):
+            pre_ln, mixing = self.fmlp_layers[i](
+                x=seqs,
+                layer_norm=self.attn_post_lns[i],
+                output_mixing=return_mixing,
+                apply_causal_mask=self.use_causal_mask,
+                extended_attention_mask=extended_attention_mask,
+                attention_mask=attention_mask,
+            )
+            seqs = self.attn_post_lns[i](pre_ln)
             seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
             if return_mixing:
                 layer_stats.append(mixing)
+
+            ffn_residual = seqs
+            ffn_delta = self.ffn_layers[i](seqs)
+            seqs = self.ffn_post_lns[i](ffn_residual + ffn_delta)
+            seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
         outputs = seqs
 
@@ -508,48 +572,69 @@ class FMLPRec(nn.Module):
             )
 
         return logits, analysis
+    
 
-
-class AnalyzableFMLPBlock(nn.Module):
-    def __init__(self, hidden_units, maxlen, dropout_rate):
+class AnalyzableFMLPFilter(nn.Module):
+    """
+    FFT-based mixing block (no FFN). Returns pre-LN output and optional analysis.
+    """
+    def __init__(self, hidden_units: int, maxlen: int, dropout_rate: float):
         super().__init__()
-
-        self.maxlen = maxlen
-
         self.complex_weight = nn.Parameter(
             torch.randn(1, maxlen // 2 + 1, hidden_units, 2) * 0.02
         )
-
         self.filter_dropout = nn.Dropout(dropout_rate)
-        self.filter_layernorm = nn.LayerNorm(hidden_units, eps=1e-8)
 
-    def forward(self, x, output_mixing=False):
+    def forward(
+        self,
+        x: torch.Tensor,              # [B, L, H]
+        layer_norm: nn.LayerNorm,
+        output_mixing: bool = False,
+        apply_causal_mask: bool = False,
+        extended_attention_mask: Optional[torch.Tensor] = None,  # [B,1,L,L] or None
+        attention_mask: Optional[torch.Tensor] = None,  # [B, L] or None
+    ):
         if isinstance(output_mixing, torch.Tensor):
             output_mixing = False
-        """
-        x: [B, L, H]
-        """
         B, L, H = x.shape
 
-        # ----- FFT filter -----
-        x_fft = torch.fft.rfft(x, dim=1, norm="ortho")
-        weight = torch.view_as_complex(self.complex_weight[:, :x_fft.size(1)])
-        x_ifft = torch.fft.irfft(x_fft * weight, n=L, dim=1, norm="ortho")
+        weight = torch.view_as_complex(self.complex_weight[:, : (L // 2 + 1)])
+
+        # DC-only encoder with optional causal (prefix) averaging.
+        if attention_mask is None:
+            attention_mask = torch.ones((B, L), device=x.device, dtype=x.dtype)
+        else:
+            attention_mask = attention_mask.to(dtype=x.dtype)
+
+        if apply_causal_mask:
+            masked_x = x * attention_mask.unsqueeze(-1)
+            cumsum = masked_x.cumsum(dim=1)
+            counts = attention_mask.cumsum(dim=1).unsqueeze(-1)
+            x_ifft = cumsum / counts.clamp_min(1.0)
+        else:
+            total = (x * attention_mask.unsqueeze(-1)).sum(dim=1, keepdim=True)
+            counts = attention_mask.sum(dim=1, keepdim=True).unsqueeze(-1)
+            x_ifft = total / counts.clamp_min(1.0)
 
         pre_ln = x + self.filter_dropout(x_ifft)
-        out = self.filter_layernorm(pre_ln)
 
         analysis = None
         if output_mixing:
-            T = compute_fft_transfer_matrix(weight, L, x.device)
-            G = compute_position_contribution(x, T)
-
+            if apply_causal_mask:
+                tril = torch.tril(torch.ones((L, L), device=x.device))
+                counts = tril.sum(dim=1, keepdim=True).clamp_min(1.0)
+                T_used = tril / counts
+            else:
+                T_used = torch.full((L, L), 1.0 / L, device=x.device)
+            G = compute_position_contribution(x, T_used)
+            post_ln = layer_norm(pre_ln)
             analysis = {
                 "mixing_ratio": compute_mixing_ratio_from_G(G),
-                "post_ln_norm": torch.norm(out, dim=-1),
+                "post_ln_norm": torch.norm(post_ln, dim=-1),
             }
 
-        return out, analysis
+        return pre_ln, analysis
+
 
 def compute_fft_transfer_matrix(weight: torch.Tensor, L: int, device):
     """
@@ -573,10 +658,12 @@ def compute_fft_transfer_matrix(weight: torch.Tensor, L: int, device):
 def compute_position_contribution(x: torch.Tensor, T: torch.Tensor):
     """
     x: [B, L, H]
-    T: [L, L]
+    T: [L, L] or [B, L, L]
     return: G [B, L, L, H]
     """
-    return T.view(1, x.size(1), x.size(1), 1) * x.unsqueeze(1)
+    if T.dim() == 2:
+        return T.view(1, x.size(1), x.size(1), 1) * x.unsqueeze(1)
+    return T.unsqueeze(-1) * x.unsqueeze(1)
 
 
 def compute_mixing_ratio_from_G(G: torch.Tensor):
@@ -709,13 +796,14 @@ class LightSASRec(nn.Module):
 # light_sasrec_analyze.py
 # -*- coding: utf-8 -*-
 """
-LightSASRecAnalyze: LightSASRec と同一 forward 構造を保ったまま、
-各 block の Self-Attention について Kobayashi (2020) mixing 解析を取れる拡張版。
+LightSASRecAnalyze: an extension that preserves the same forward structure as
+LightSASRec while enabling Kobayashi (2020) mixing analysis for each block's
+Self-Attention.
 
-重要:
-- 「blockごとに独立したLN」＝ attention_layernorms[i] を LightSASRec と同様に持つ
-- AnalyzableMHA 側には LN を一切持たせない（責務分離）
-- forward の計算順は LightSASRec と同じ:
+Important:
+- "independent LN per block" = keep attention_layernorms[i] as in LightSASRec
+- AnalyzableMHA carries no LN at all (clear separation of responsibilities)
+- forward order matches LightSASRec:
     Embedding + Pos + Dropout
     mask (pad)
     for each block:
@@ -763,13 +851,13 @@ def save_analysis_batch_npz(
 
 class NormMixingOutput(nn.Module):
     """
-    Kobayashi (2020) に基づくノルムベース分解を
-    SASRec / LightSASRec の MultiheadAttention に適用する解析モジュール。
+    Analysis module that applies the Kobayashi (2020) norm-based decomposition
+    to MultiheadAttention in SASRec / LightSASRec.
 
-    解析できる mixing ratio:
-      - Attn-N        : attention のみ
-      - AttnRes-N     : attention + residual（LN 前）
-      - AttnResLN-N   : attention + residual + LayerNorm（LN 後）
+    Supported mixing ratios:
+      - Attn-N        : attention only
+      - AttnRes-N     : attention + residual (pre-LN)
+      - AttnResLN-N   : attention + residual + LayerNorm (post-LN)
     """
     def __init__(self, hidden_size: int, num_heads: int):
         super().__init__()
@@ -779,7 +867,7 @@ class NormMixingOutput(nn.Module):
 
     def forward(
         self,
-        hidden_states,      # [B, L, H] = Q (LN 済み)
+        hidden_states,      # [B, L, H] = Q (after LN)
         attention_probs,   # [B, Hh, L, L]
         value_layer,       # [B, Hh, L, Dh]
         out_proj,          # nn.Linear(H, H)
@@ -896,12 +984,12 @@ class NormMixingOutput(nn.Module):
 # ======================================================
 class AnalyzableMHA(nn.Module):
     """
-    nn.MultiheadAttention をそのまま使い、
-    attention_weights と value を取り出して mixing 解析する。
+    Use nn.MultiheadAttention as-is, extract attention_weights and value for
+    mixing analysis.
 
-    注意:
-    - 入力 Q は「すでに block LN を通ったもの」を渡す
-    - forward では LightSASRec と同じく out = Q + MHA(Q,Q,Q) を返す
+    Notes:
+    - The input Q is expected to already pass through the block LN.
+    - forward returns out = Q + MHA(Q,Q,Q), matching LightSASRec.
     """
     def __init__(self, hidden_size: int, num_heads: int, dropout: float):
         super().__init__()
@@ -912,7 +1000,7 @@ class AnalyzableMHA(nn.Module):
             embed_dim=hidden_size,
             num_heads=num_heads,
             dropout=dropout,
-            batch_first=False,  # LightSASRec と合わせる
+            batch_first=False,  # match LightSASRec
         )
         self.out_dropout = nn.Dropout(dropout)
 
@@ -923,10 +1011,10 @@ class AnalyzableMHA(nn.Module):
         Q: torch.Tensor,  # [L,B,H]
     ) -> torch.Tensor:
         """
-        nn.MultiheadAttention と同一の in_proj で V を作り、head へ reshape する。
+        Build V using the same in_proj as nn.MultiheadAttention, then reshape to heads.
         value_layer: [B, Hh, L, Dh]
         """
-        # Q を [B,L,H] へ
+        # convert Q to [B,L,H]
         q_blh = Q.transpose(0, 1)  # [B,L,H]
         B, L, H = q_blh.shape
         Hh = self.num_heads
@@ -993,7 +1081,7 @@ class AnalyzableMHA(nn.Module):
 
                 analysis_dict = {
                     **mixing,
-                    "attention": attn_probs.mean(dim=1),  # ★ [B,L,L]
+                    "attention": attn_probs.mean(dim=1),  # [B,L,L]
                 }
 
             return out, analysis_dict
@@ -1002,9 +1090,9 @@ class AnalyzableMHA(nn.Module):
 
 class LightSASRecAnalyze(nn.Module):
     """
-    指定順序に準拠:
-    Embedding → Dropout → LN →
-      [ MHA → Dropout → Residual → LN ] × N →
+    Follow the specified order:
+    Embedding -> Dropout -> LN ->
+      [ MHA -> Dropout -> Residual -> LN ] x N ->
     Prediction
     """
 
@@ -1045,7 +1133,7 @@ class LightSASRecAnalyze(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        # blockごとの Post-LN
+        # Per-block Post-LN
         self.block_layernorms = nn.ModuleList([
             nn.LayerNorm(hidden_units, eps=1e-8)
             for _ in range(num_blocks)
@@ -1108,11 +1196,11 @@ class LightSASRecAnalyze(nn.Module):
             # [B,L,H] → [L,B,H]
             seqs_t = seqs.transpose(0, 1)
 
-            # MHA（LNなし）
+            # MHA (no LN)
             attn_out, mixing = self.attention_layers[i](
                 Q=seqs_t,
                 attn_mask=attn_mask,
-                layer_norm=self.block_layernorms[i],  # 解析用
+                layer_norm=self.block_layernorms[i],  # for analysis
                 output_mixing=return_mixing,
                 residual_scale=self.residual_scale_eval if apply_residual_scale else 1.0,
             )
@@ -1123,7 +1211,7 @@ class LightSASRecAnalyze(nn.Module):
             # Dropout → Residual → LN
             seqs = self.block_layernorms[i](attn_out)
 
-            # padding 無効化
+            # disable padding
             seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
             if return_mixing:
@@ -1153,8 +1241,8 @@ class LightSASRecAnalyze(nn.Module):
 
 class PointWiseFFNNoResidual(nn.Module):
     """
-    SASRecのPointWise FFN相当（Conv1d kernel=1）だが、
-    residual は外で足す（解析設計を崩さず安全）
+    PointWise FFN equivalent to SASRec (Conv1d kernel=1), but without residual
+    inside; residual is added externally to preserve analysis design.
     """
     def __init__(self, hidden_units: int, dropout_rate: float):
         super().__init__()
@@ -1176,10 +1264,12 @@ class PointWiseFFNNoResidual(nn.Module):
         return y.transpose(1, 2)
     
 
+
+
 class SASRecAnalyze(nn.Module):
     """
-    FFNを含むSASRecをforwardしつつ、
-    解析は「Attn + Residual + LN」のみ（FFNは解析しない）
+    Forward SASRec including FFN, while analyzing only "Attn + Residual + LN"
+    (FFN is not analyzed).
     """
 
     def __init__(
@@ -1195,7 +1285,7 @@ class SASRecAnalyze(nn.Module):
         padding_idx: int = 0,
         analysis_dir: Optional[str] = "./analysis_out",
         residual_scale_eval: float = 1.0,
-        use_key_padding_mask: bool = True,  # 厳密にPADを遮断したいならTrue
+        use_key_padding_mask: bool = True,  # set True to strictly mask PAD
     ):
         super().__init__()
 
@@ -1218,7 +1308,7 @@ class SASRecAnalyze(nn.Module):
         self.emb_dropout = nn.Dropout(dropout_rate)
         self.emb_layernorm = nn.LayerNorm(hidden_units, eps=1e-8)
 
-        # Attention blocks (解析対象)
+        # Attention blocks (analysis target)
         self.attn_layers = nn.ModuleList([
             AnalyzableMHA(hidden_units, num_heads=num_heads, dropout=dropout_rate)
             for _ in range(num_blocks)
@@ -1228,7 +1318,7 @@ class SASRecAnalyze(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        # FFN blocks (forwardのみ、解析しない)
+        # FFN blocks (forward only, not analyzed)
         self.ffn_layers = nn.ModuleList([
             PointWiseFFNNoResidual(hidden_units, dropout_rate)
             for _ in range(num_blocks)
@@ -1238,7 +1328,7 @@ class SASRecAnalyze(nn.Module):
             for _ in range(num_blocks)
         ])
 
-        # Final LN（お好み。SASRec系は最後に入れることが多い）
+        # Final LN (optional; SASRec variants often add it at the end)
         self.last_layernorm = nn.LayerNorm(hidden_units, eps=1e-8)
 
         self.apply(self._init_weights)
@@ -1259,7 +1349,7 @@ class SASRecAnalyze(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,         # [B,L]
-        attention_mask=None,             # unused (互換用)
+        attention_mask=None,             # unused (for compatibility)
         return_mixing: bool = False,
         save_analysis: bool = False,
         analysis_batch_idx: int = 0,
@@ -1292,22 +1382,22 @@ class SASRecAnalyze(nn.Module):
             # ---- (Attn) ----
             seqs_t = seqs.transpose(0, 1)  # [L,B,H]
 
-            # AnalyzableMHA は「out = residual_scale*Q + Attn(Q)」(LN前) を返す
+            # AnalyzableMHA returns "out = residual_scale*Q + Attn(Q)" (pre-LN)
             attn_out_t, mixing = self.attn_layers[i](
                 Q=seqs_t,
                 attn_mask=attn_mask,
-                layer_norm=self.attn_post_lns[i],  # ★解析用LN（Attn後）
+                layer_norm=self.attn_post_lns[i],  # LN for analysis (post-Attn)
                 output_mixing=return_mixing,
                 residual_scale=self.residual_scale_eval if (apply_residual_scale) else 1.0,
             )
 
-            # Post-LN（Attn+Res+LN の出力）
+            # Post-LN (output of Attn+Res+LN)
             seqs = self.attn_post_lns[i](attn_out_t.transpose(0, 1))  # [B,L,H]
             seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
-            # ★解析はここで確定（FFNは解析しない）
+            # Analysis is finalized here (FFN is not analyzed)
             if return_mixing:
-                # mixing には attn_mixing_ratio / attnres_mixing_ratio / mixing_ratio(=AttnResLN) + attention が入ってる想定
+                # mixing includes attn_mixing_ratio / attnres_mixing_ratio / mixing_ratio(=AttnResLN) + attention
                 layer_stats.append(mixing)
 
             # ---- (FFN) forward only ----
@@ -1378,10 +1468,10 @@ if __name__ == "__main__":
 # ======================================================
 # class LightSASRecAnalyze(nn.Module):
 #     """
-#     LightSASRec と forward 構造を一致させつつ mixing 解析を返すモデル。
+#     Model that returns mixing analysis while matching LightSASRec's forward structure.
 
-#     return_mixing=True のとき:
-#       logits, analysis_dict を返す
+#     When return_mixing=True:
+#       return logits, analysis_dict
 #     """
 #     def __init__(
 #         self,
@@ -1413,12 +1503,12 @@ if __name__ == "__main__":
 #         self.pos_emb = nn.Embedding(maxlen, hidden_units)
 #         self.emb_dropout = nn.Dropout(dropout_rate)
 
-#         # ★ blockごとに独立LN（元 LightSASRec と同じ）
+#         # Independent LN per block (same as original LightSASRec)
 #         self.attention_layernorms = nn.ModuleList([
 #             nn.LayerNorm(hidden_units, eps=1e-8) for _ in range(num_blocks)
 #         ])
 
-#         # ★ attention本体（LNは持たない）
+#         # Attention core (no LN inside)
 #         self.attention_layers = nn.ModuleList([
 #             AnalyzableMHA(hidden_units, num_heads=num_heads, dropout=dropout_rate)
 #             for _ in range(num_blocks)
@@ -1445,7 +1535,7 @@ if __name__ == "__main__":
 #     def forward(
 #         self,
 #         input_ids: torch.Tensor,
-#         attention_mask=None,                 # ignored (互換用)
+#         attention_mask=None,                 # ignored (for compatibility)
 #         return_mixing: bool = True,
 #         save_analysis: bool = True,
 #         analysis_batch_idx: int = 0,
@@ -1458,7 +1548,7 @@ if __name__ == "__main__":
 #         B, L = input_ids.size()
 #         device = input_ids.device
 
-#         # ===== Embedding + Pos + Dropout (LightSASRecと同じ) =====
+#         # ===== Embedding + Pos + Dropout (same as LightSASRec) =====
 #         seqs = self.item_emb(input_ids)
 #         seqs *= self.item_emb.embedding_dim ** 0.5
 
@@ -1466,11 +1556,11 @@ if __name__ == "__main__":
 #         seqs = seqs + self.pos_emb(positions)
 #         seqs = self.emb_dropout(seqs)
 
-#         # pad mask (LightSASRecと同じ: timeline_mask を掛ける)
+#         # pad mask (same as LightSASRec: apply timeline_mask)
 #         timeline_mask = (input_ids == self.padding_idx)  # bool [B,L]
 #         seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
-#         # causal mask (LightSASRecと同じ: True=mask)
+#         # causal mask (same as LightSASRec: True=mask)
 #         attn_mask = ~torch.tril(torch.ones((L, L), dtype=torch.bool, device=device))
 
 #         layer_stats: List[Dict[str, torch.Tensor]] = []
@@ -1480,10 +1570,10 @@ if __name__ == "__main__":
 #             # [B,L,H] -> [L,B,H]
 #             seqs_t = torch.transpose(seqs, 0, 1)
 
-#             # block LN (独立)
+#             # block LN (independent)
 #             Q = self.attention_layernorms[i](seqs_t)
 
-#             # mha + residual (LightSASRec互換: seqs = Q + mha(Q,Q,Q))
+#             # mha + residual (LightSASRec-compatible: seqs = Q + mha(Q,Q,Q))
 #             out, mixing = self.attention_layers[i](
 #                 Q,
 #                 attn_mask=attn_mask,
@@ -1495,13 +1585,13 @@ if __name__ == "__main__":
 #             seqs = seqs * (~timeline_mask).unsqueeze(-1)
 
 #             if return_mixing:
-#                 # mixing は dict
+#                 # mixing is a dict
 #                 layer_stats.append(mixing)
 
-#         # ===== last LN (LightSASRecと同じ) =====
+#         # ===== last LN (same as LightSASRec) =====
 #         outputs = self.last_layernorm(seqs)
 
-#         # ===== head (LNなし、LightSASRecと同じ) =====
+#         # ===== head (no LN, same as LightSASRec) =====
 #         if self.add_head:
 #             logits = torch.matmul(outputs, self.item_emb.weight.t())
 #         else:

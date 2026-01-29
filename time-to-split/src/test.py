@@ -32,7 +32,7 @@ def load_metrics_wide_format(path: Path):
 
 def bucket_summary(sas_all: pd.DataFrame, light_all: pd.DataFrame, alpha=0.05):
     metrics = sorted(set(sas_all.columns) & set(light_all.columns))
-    # HR@1/NDCG@1/MRR@1 は値が同一なので集計上は1つにまとめる
+    # HR@1/NDCG@1/MRR@1 are identical, so treat them as one for aggregation
     aliases = {
         "test_HitRate@1": "rank@1",
         "test_NDCG@1": "rank@1",
@@ -160,7 +160,7 @@ def analyze_leave_one_out(dataset="Sports"):
 def analyze_global_timesplit(dataset="Sports", quantile="q09", file_name="test_last.csv"):
     base = ROOT / f"data/results/global_timesplit/val_by_time/{dataset}/{quantile}"
 
-    # 1) Try X_*.csv under test_last/ (sameスタイル as leave-one-out)
+    # 1) Try X_*.csv under test_last/ (same style as leave-one-out)
     sas_glob = list((base / "SASRec" / "test_last").glob("X_64_2_2_0.5_200_*.csv"))
     light_glob = list((base / "LightSASRec" / "test_last").glob("X_64_2_2_0.5_200_*.csv"))
 

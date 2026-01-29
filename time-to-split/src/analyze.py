@@ -183,7 +183,7 @@ def latest_mixing_stats(latest_vals: np.ndarray, atol: float = 1e-8) -> dict:
         "min": float(np.min(latest_vals)),
         "max": float(np.max(latest_vals)),
         "mean": float(np.mean(latest_vals)),
-        "median": float(np.median(latest_vals)),   # ★ 追加
+        "median": float(np.median(latest_vals)),   # added
         "std": float(np.std(latest_vals)),
         "num_nonzero": int(np.sum(np.abs(latest_vals) > atol)),
         "fraction_nonzero": float(np.mean(np.abs(latest_vals) > atol)),
@@ -575,7 +575,7 @@ def collect_all_mixing_ratio_strict(
             ids = ids_all[b]
             mix = mix_all[b]
 
-            v = extract_valid(ids, mix)  # padding 除外のみ
+            v = extract_valid(ids, mix)  # remove padding only
             if v.size == 0:
                 continue
 
@@ -623,7 +623,7 @@ def collect_all_generic_mixing_ratio_strict(
             ids = ids_all[b]
             mix = mix_all[b]
 
-            v = extract_valid(ids, mix)   # padding 除外のみ
+            v = extract_valid(ids, mix)   # remove padding only
             if v.size == 0:
                 continue
 
@@ -763,7 +763,7 @@ if __name__ == "__main__":
       print(
           f"[Layer {layer}] latest-item ATTENTION mixing ratio: "
           f"mean={latest_attn_mr.mean():.4f}, "
-          f"median={np.median(latest_attn_mr):.4f}, "   # ★ 追加
+          f"median={np.median(latest_attn_mr):.4f}, "   # added
           f"std={latest_attn_mr.std():.4f}, "
           f"N={len(latest_attn_mr)}"
       )

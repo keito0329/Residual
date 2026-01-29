@@ -142,7 +142,7 @@ class SeqRec(SeqRecBase):
 
         outputs = self.model(batch['input_ids'], batch['attention_mask'])
         loss = self.compute_loss(outputs, batch)
-        
+
         return loss
 
     def compute_loss(self, outputs, batch):
@@ -229,7 +229,7 @@ class SeqRec(SeqRecBase):
 
     # def prediction_output(self, batch):
     #     if isinstance(self.model, LightSASRecAnalyze):
-    #         # ここでは return_analysis/save_analysis を付けずに呼ぶ
+    #         # Call without return_analysis/save_analysis here
     #         outputs = self.model(batch['input_ids'], batch['attention_mask'])
     #     else:
     #         outputs = self.model(
