@@ -7,11 +7,18 @@ This repository runs norm-based analysis of SASRec on top of the `time-to-split`
 For full experimental pipelines and reproducibility details, see `time-to-split/README.md`.
 
 
-## Section 3.1 Results
+## Section 3.1 Results (all datasets)
 
 The figure below shows results on nine datasets when inputs are shuffled at inference time.
 
 ![Shuffle histogram](time-to-split/images/shuffle_histogram.png)
+
+## Section 3.2 Results (K=10)
+
+The image below shows HRLI and HRL2I computed at K=10.
+
+![HRLI vs HRL2I at K=10](time-to-split/images/hist_comparison_10.png)
+
 
 
 ## Structure
