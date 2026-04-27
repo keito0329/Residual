@@ -24,6 +24,7 @@ Properties:
 
 import os
 import glob
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Optional, List
@@ -664,13 +665,112 @@ def collect_all_layers_mixing_ratio_strict(
 
 
 
+def compute_row_entropy(attn: np.ndarray, eps: float = 1e-12):
+    """
+    Normalized row-wise entropy.
+    Returns 0 when sequence length is 1.
+    """
+    if attn.ndim != 2:
+        raise ValueError("attn must be [L, L]")
+
+    L = attn.shape[1]
+
+    if L <= 1:
+        return np.zeros(attn.shape[0], dtype=np.float64)
+
+    p = np.clip(attn, eps, 1.0)
+    entropy = -np.sum(p * np.log(p), axis=1)
+
+    max_entropy = np.log(L)
+
+    return entropy / max_entropy
+
+
+
+def collect_all_attention_entropy_strict(
+    analysis_dir: str,
+    layer: int = 0,
+):
+    """
+    Collect normalized row-wise entropy for all valid positions.
+    STRICT:
+      - remove padding only
+      - no reverse / recentK
+    """
+    batches = load_all_batches(analysis_dir)
+    vals = []
+
+    key = f"layer{layer}_attention"
+
+    for batch in batches:
+        ids_all = batch["input_ids"]
+        attn_all = batch[key]
+
+        for b in range(ids_all.shape[0]):
+            ids = ids_all[b]
+            attn = attn_all[b]
+
+            a = extract_valid(ids, attn)
+            if a.size == 0:
+                continue
+
+            ent = compute_row_entropy(a)
+            vals.append(ent)
+
+    if not vals:
+        return np.array([])
+
+    return np.concatenate(vals).astype(np.float64)
+
+
+
+
 # =========================
 # Main
 # =========================
 if __name__ == "__main__":
-    # >>> CHANGE HERE <<<
-    analysis_dir = "./data/results/analysis/SASRecAnalyze/Movielens-1m/global_timesplit/seed_17"
-    # >>>>>>>>>>>>>>>>>>
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dataset", type=str, help="dataset name (e.g., Sports)")
+    ap.add_argument("--model", type=str, default="SASRecAnalyze")
+    ap.add_argument("--split", type=str, default="global_timesplit")
+    ap.add_argument("--seed", type=str, default="seed_1")
+    args = ap.parse_args()
+
+    # Preferred path (most common)
+    analysis_dir = os.path.join(
+        "data",
+        "results",
+        "analysis",
+        args.model,
+        args.dataset,
+        args.split,
+        args.seed,
+    )
+
+    if not os.path.isdir(analysis_dir):
+        # Fallback: try to find a unique match for the dataset
+        pattern = os.path.join(
+            "data",
+            "results",
+            "analysis",
+            "*",
+            args.dataset,
+            args.split,
+            "seed_*",
+        )
+        matches = sorted(glob.glob(pattern))
+        if len(matches) == 1:
+            analysis_dir = matches[0]
+        elif len(matches) == 0:
+            raise RuntimeError(
+                f"No analysis directory found for dataset '{args.dataset}'. "
+                f"Tried: {analysis_dir} and pattern {pattern}"
+            )
+        else:
+            raise RuntimeError(
+                "Multiple analysis directories found. "
+                f"Please specify --model/--seed. Candidates: {matches}"
+            )
 
     fig_dir = os.path.join(analysis_dir, f"figures_avg_recent{RECENT_K}_sourceDown")
     ensure_dir(fig_dir)
@@ -818,3 +918,19 @@ if __name__ == "__main__":
     print("  AttnResLN-N (Layer0+1):")
     for k, v in mixing_stats(postln_vals_01).items():
         print(f"    {k}: {v}")
+
+
+    print("\n[Attention Entropy Statistics]")
+
+    for layer in range(num_layers):
+        ent_vals = collect_all_attention_entropy_strict(
+            analysis_dir,
+            layer=layer,
+        )
+
+        stats = mixing_stats(ent_vals)
+
+        print(f"[Layer {layer}] Row-wise Attention Entropy")
+        for k, v in stats.items():
+            print(f"    {k}: {v}")
+

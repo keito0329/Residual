@@ -6,7 +6,8 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch import nn
-from src.models import BERT4Rec, LightSASRecAnalyze, SASRecAnalyze  # Added SASRecAnalyze
+from src.models import BERT4Rec, LightSASRecAnalyze, SASRecAnalyze, FreqRec, DuoRec  # Added SASRecAnalyze
+from src.diffurec import DiffuRecModel
 from pytorch_lightning.trainer.states import RunningStage
 
 class SeqRecBase(pl.LightningModule):
@@ -119,7 +120,8 @@ class SeqRec(SeqRecBase):
     def __init__(self, model, lr=1e-3, padding_idx=0,
                  predict_top_k=10, filter_seen=True,
                  use_lmp=False, lmp_h=0, lmp_lambda=None, lmp_decay=0.5,
-                 causal_mask_at_inference=False, save_analysis_npz=True):
+                 causal_mask_at_inference=False, save_analysis_npz=True,
+                 npz_keys=None):
         # Added for LMP: keep backward compat defaults
         super().__init__(model, lr=lr, padding_idx=padding_idx,
                          predict_top_k=predict_top_k, filter_seen=filter_seen)
@@ -130,6 +132,7 @@ class SeqRec(SeqRecBase):
         self.lmp_decay = lmp_decay
         self.causal_mask_at_inference = causal_mask_at_inference
         self.save_analysis_npz = save_analysis_npz
+        self.npz_keys = npz_keys
 
     def _build_causal_attention_mask(self, attention_mask: torch.Tensor) -> torch.Tensor:
         seq_len = attention_mask.size(1)
@@ -140,8 +143,31 @@ class SeqRec(SeqRecBase):
 
     def training_step(self, batch, batch_idx):
 
-        outputs = self.model(batch['input_ids'], batch['attention_mask'])
-        loss = self.compute_loss(outputs, batch)
+        same_target = batch.get('same_target', None)
+        if isinstance(self.model, DiffuRecModel):
+            outputs = self.model(batch['input_ids'], batch['attention_mask'],
+                                 labels=batch['labels'])
+        elif same_target is not None:
+            outputs = self.model(batch['input_ids'], batch['attention_mask'],
+                                 same_target=same_target)
+        else:
+            outputs = self.model(batch['input_ids'], batch['attention_mask'])
+        # Handle (None, loss) from DiffuRec
+        if isinstance(outputs, tuple) and len(outputs) == 2 and outputs[0] is None:
+            return outputs[1]
+        # Models may return tuples:
+        #   (logits, fft_loss, alpha_loss) — FreqRec with fourier_loss=True
+        #     → total = alpha_loss * CE + (1 - alpha_loss) * fft_loss
+        #   (logits, aux_loss) — other models with auxiliary loss
+        #     → total = CE + aux_loss
+        if isinstance(outputs, tuple) and len(outputs) == 3:
+            logits, fft_loss, alpha_loss = outputs
+            loss = alpha_loss * self.compute_loss(logits, batch) + (1.0 - alpha_loss) * fft_loss
+        elif isinstance(outputs, tuple):
+            logits, aux_loss = outputs
+            loss = self.compute_loss(logits, batch) + aux_loss
+        else:
+            loss = self.compute_loss(outputs, batch)
 
         return loss
 
@@ -182,6 +208,7 @@ class SeqRec(SeqRecBase):
         analyzable_classes = (LightSASRecAnalyze, SASRecAnalyze)
         want_save_analysis = bool(getattr(self, "save_analysis_npz", True))
         want_analysis = isinstance(self.model, analyzable_classes) and is_predict and want_save_analysis
+        want_duorec_analysis = isinstance(self.model, DuoRec) and is_predict and want_save_analysis
 
         if isinstance(self.model, analyzable_classes):
             output = self.model(
@@ -212,6 +239,27 @@ class SeqRec(SeqRecBase):
                 save_analysis=want_norms,
                 analysis_batch_idx=batch_idx if batch_idx is not None else getattr(self, "global_step", 0),
                 residual_scale=residual_scale,  # Added by Author
+            )
+        elif isinstance(self.model, DuoRec):
+            residual_scale = (
+                float(getattr(self.model, "residual_scale_eval", 1.0)) if is_predict else 1.0
+            )
+            output = self.model(
+                batch['input_ids'],
+                batch['attention_mask'],
+                residual_scale=residual_scale,
+                return_mixing=want_duorec_analysis,
+                save_analysis=want_duorec_analysis,
+                analysis_batch_idx=batch_idx if batch_idx is not None else getattr(self, "global_step", 0),
+            )
+        elif isinstance(self.model, FreqRec):
+            residual_scale = (
+                float(getattr(self.model, "residual_scale_eval", 1.0)) if is_predict else 1.0
+            )
+            output = self.model(
+                batch['input_ids'],
+                batch['attention_mask'],
+                residual_scale=residual_scale,
             )
         else:
             output = self.model(

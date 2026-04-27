@@ -50,12 +50,21 @@ class CausalLMDataset(LMDataset):
                  shift_labels=True, num_negatives=None,
                  full_negative_sampling=False,
                  user_col='user_id', item_col='item_id',
-                 time_col='timestamp'):
+                 time_col='timestamp',
+                 provide_same_target=False):
 
         super().__init__(df, max_length, num_negatives, full_negative_sampling,
                          user_col, item_col, time_col)
 
         self.shift_labels = shift_labels
+        self.provide_same_target = provide_same_target
+
+        if provide_same_target:
+            # index: target item (last item in sequence) -> list of user indices
+            self._target_to_indices: dict = {}
+            for i, user_id in enumerate(self.user_ids):
+                target = self.data[user_id][-1]
+                self._target_to_indices.setdefault(target, []).append(i)
 
     def __getitem__(self, idx):
 
@@ -70,11 +79,26 @@ class CausalLMDataset(LMDataset):
         else:
             labels = input_ids
 
-        if self.num_negatives:
-            negatives = self.sample_negatives(item_sequence)
-            return {'input_ids': input_ids, 'labels': labels, 'negatives': negatives}
+        result = {'input_ids': input_ids, 'labels': labels}
 
-        return {'input_ids': input_ids, 'labels': labels}
+        if self.provide_same_target:
+            target = self.data[self.user_ids[idx]][-1]
+            candidates = self._target_to_indices[target]
+            if len(candidates) > 1:
+                aug_idx = idx
+                while aug_idx == idx:
+                    aug_idx = int(np.random.choice(candidates))
+            else:
+                aug_idx = idx  # fallback: same sequence
+            aug_seq = self.data[self.user_ids[aug_idx]]
+            if len(aug_seq) > self.max_length + 1:
+                aug_seq = aug_seq[-self.max_length - 1:]
+            result['same_target'] = np.array(aug_seq[:-1])
+
+        if self.num_negatives:
+            result['negatives'] = self.sample_negatives(item_sequence)
+
+        return result
 
 
 class CausalLMPredictionDataset(LMDataset):

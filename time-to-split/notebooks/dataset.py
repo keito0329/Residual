@@ -29,5 +29,5 @@ def display_detailed_stats(data, dataset_name):
   
 # Example usage
 data_path = os.environ["SEQ_SPLITS_DATA_PATH"]  
-data = pd.read_csv(os.path.join(data_path, "preprocessed", "Steam.csv"))  
-display_detailed_stats(data, "Steam")
+data = pd.read_csv(os.path.join(data_path, "preprocessed", "Yelp.csv"))  
+display_detailed_stats(data, "yelp")
