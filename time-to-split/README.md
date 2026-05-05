@@ -1,31 +1,4 @@
-<h1 align="center"> Time to Split: Exploring Data Splitting Strategies for Offline Evaluation of Sequential Recommenders</h1>
 
-
-<a href="https://arxiv.org/abs/2507.16289"><img src="https://img.shields.io/badge/arXiv-2507.16289-b31b1b.svg" height=22.5><a>
-[![Cite](https://img.shields.io/badge/Cite-BibTeX-%238a91faff)](https://github.com/monkey0head/time-to-split?tab=readme-ov-file#-citation)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
-![PyTorch](https://img.shields.io/badge/framework-PyTorch-EE4C2C?logo=pytorch)
-
-<p>
-  <a href="https://scholar.google.com/citations?user=EqAyueEAAAAJ&amp;hl">Danil Gusak<sup>*</sup></a>,
-  <a href="https://scholar.google.com/citations?user=rYp0bDkAAAAJ&amp;hl">Anna Volodkevich<sup>*</sup></a>,
-  <a href="https://scholar.google.com/citations?user=eGTslO8AAAAJ&amp;hl">Anton Klenitskiy<sup>*</sup></a>,
-  <a href="https://scholar.google.com/citations?user=4vb0JIwAAAAJ&amp;hl">Alexey Vasilev</a>,
-  <a href="https://scholar.google.com/citations?user=l6cMdUEAAAAJ&amp;hl">Evgeny Frolov</a>
-</p>
-
-
-> Sequential recommender systems currently dominate next‑item prediction task, but common evaluation protocols for sequential recommendations often fall short of real‑world scenarios. **Leave‑one‑out** splits introduce temporal leakage and unrealistically long test horizons, while **global temporal** splits lack clear rules for selecting target interactions and constructing a validation subset that provides necessary consistency between validation and test metrics. We systematically compare splitting strategies across multiple datasets and baselines, showing that your **choice of split can significantly reorder model rankings and influence deployment decisions**. Our results lay the groundwork for more realistic and reproducible evaluation guidelines.
-
-
-<div align="center">
-    <a >
-        <img src="assets/splits.png" width="100%">
-    </a>
-    <p>
-        <i>Data splitting and target selection strategies for sequential recommendations. (a) Leave-one-out split. (b) Global temporal split: all interactions after timepoint T_test are placed in the holdout set, targets for these holdout sequences are chosen according to (c). (c) Target items selection options for each holdout sequence (applicable for both test and validation sequences).</i>
-    </p>
-</div>
 
 ## Usage
 
@@ -195,17 +168,4 @@ you can find `.csv` files containing all test and validation metrics for differe
 - [Test_vs_test.ipynb](notebooks/Test_vs_test.ipynb) reproduces Figure 5 and Figure 6 from the paper,
 - [Test_vs_validation.ipynb](notebooks/Test_vs_validation.ipynb) reproduces Figure 8.
 
-
-## 📜 Citation
-
-If you find our work helpful, please consider citing the paper:
-
-```bibtex
-@inproceedings{timetosplit2025,
-  title={Time to Split: Exploring Data Splitting Strategies for Offline Evaluation of Sequential Recommenders},
-  author={Gusak, Danil and Volodkevich, Anna and Klenitskiy, Anton and Vasilev, Alexey and Frolov, Evgeny},
-  booktitle={Proceedings of the 19th ACM Conference on Recommender Systems},
-  doi={10.1145/3705328.3748164},
-  year={2025}
-}
 ```
