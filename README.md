@@ -52,6 +52,18 @@ Each dataset directory contains:
 - `residual_scaling_vs_hrli_attnresln.pdf`
 - `hrli_vs_accuracy.pdf`
 
+## Section 5.4 Validation-Based Selection (all datasets)
+
+Validation-based alpha selection and oracle-comparison figures for all datasets are saved under:
+`time-to-split/section5_4_alpha_oracle_epsilon_plots/`
+
+Each dataset directory contains:
+- `alpha_selection_comparison.png`
+- `epsilon_vs_performance.png`
+
+The plotted values are summarized in:
+`time-to-split/section5_4_alpha_oracle_epsilon_plots/summary.csv`
+
 ## Structure
 - `time-to-split/`: Research codebase (vendored from the original repository)
 
